@@ -81,31 +81,6 @@ fn file_to_events(filename: &PathBuf) -> Result<Vec<PerformanceEvent>, midly::Er
                 t -= t_chunk;
             }
             previous_t = Some(t_chunk);
-            /*
-            let ticks = ticks as f64;
-            // event times are stored as ticks, so convert to milliseconds
-            let ms = ticks * ms_per_tick;
-            // combine repeated delta time events
-            let mut t = ms + previous_t.unwrap_or(0.0);
-
-            // we can only represent a max time of 1 second (1000 ms)
-            // so we must split up times that are larger than that
-            // into separate events
-            let mut t_chunk = 0.0;
-            while t > 0.0 {
-                t_chunk = if t > 1000.0 { 1000.0 } else { t };
-                let event = PerformanceEvent::TimeShift((t_chunk / 10.0).ceil() as u8 - 1);
-                if previous_t == None {
-                    events.push(event);
-                } else {
-                    // update the last time event to combine timeshifts
-                    *(events.last_mut().unwrap()) = event;
-                    previous_t = None;
-                }
-                t -= t_chunk;
-            }
-            previous_t = Some(t_chunk);
-            */
         }
 
         match event.kind {
