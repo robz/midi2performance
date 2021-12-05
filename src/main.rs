@@ -131,9 +131,9 @@ fn file_to_events(filename: &PathBuf) -> Result<Vec<PerformanceEvent>, midly::Er
     Ok(events)
 }
 
-fn convert_maestro(input_path: &str, output_path: &str) -> Result<(), Error> {
+fn convert_directory_recursively(input_path: &str, output_path: &str) -> Result<(), Error> {
     if !Path::new(output_path).is_dir() {
-        fs::create_dir(&output_path).expect(&format!(
+        fs::create_dir_all(&output_path).expect(&format!(
             "could not create output directory '{}'",
             output_path
         ));
@@ -142,35 +142,30 @@ fn convert_maestro(input_path: &str, output_path: &str) -> Result<(), Error> {
         .expect(&format!("could not read input directory '{}'", input_path))
     {
         let path = entry?.path();
-        if path.metadata()?.is_file() {
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if path.metadata()?.is_dir() {
+            println!("processing {}...", name);
+            let output_subdir = format!("{}/{}", output_path, name);
+            convert_directory_recursively(path.to_str().unwrap(), &output_subdir)?;
             continue;
         }
-        println!("processing {:?}...", path.file_name().unwrap());
-        for entry in path.read_dir()? {
-            let path = entry?.path();
-            let events = match file_to_events(&path) {
-                Ok(events) => events,
-                Err(error) => {
-                    println!(
-                        "Failed to parse file {:?} due to midly error: {}",
-                        path, error
-                    );
-                    continue;
-                }
-            };
-            let events: Vec<i16> = events.into_iter().map(|x| event_to_index(&x)).collect();
-            let output_name = format!(
-                "{}/{}.pt",
-                output_path,
-                path.file_name().unwrap().to_str().unwrap()
-            );
-            println!("{}", output_name);
-            Tensor::of_slice(&events)
-                .save(output_name)
-                .expect("unable to save events to pytorch file");
-        }
+        let events = match file_to_events(&path) {
+            Ok(events) => events,
+            Err(error) => {
+                println!(
+                    "Failed to parse file {:?} due to midly error: {}",
+                    path, error
+                );
+                continue;
+            }
+        };
+        let events: Vec<i16> = events.into_iter().map(|x| event_to_index(&x)).collect();
+        let output_name = format!("{}/{}.pt", output_path, name);
+        println!("{}", output_name);
+        Tensor::of_slice(&events)
+            .save(output_name)
+            .expect("unable to save events to pytorch file");
     }
-    println!("done!");
     return Ok(());
 }
 
@@ -178,6 +173,7 @@ fn main() -> Result<(), Error> {
     let args: Vec<String> = env::args().collect();
     let input_path = &args[1];
     let output_path = &args[2];
-    convert_maestro(input_path, output_path)?;
+    convert_directory_recursively(input_path, output_path)?;
+    println!("done!");
     return Ok(());
 }
