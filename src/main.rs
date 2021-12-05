@@ -1,54 +1,56 @@
 use midly::{num::u7, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
-use std::collections::HashSet;
-use std::fs;
+use std::{
+    collections::HashSet,
+    env, fs,
+    io::Error,
+    path::{Path, PathBuf},
+};
 use tch::Tensor;
 
+#[derive(Debug)]
 enum PerformanceEvent {
-    NoteOn(u8),
-    NoteOff(u8),
+    NoteOn(u7),
+    NoteOff(u7),
     TimeShift(u8),
-    Velocity(u8),
+    Velocity(u7),
 }
 
-fn event_to_string(event: &PerformanceEvent) -> String {
-    return match event {
-        PerformanceEvent::NoteOn(v) => format!("NoteOn {}", v),
-        PerformanceEvent::NoteOff(v) => format!("NoteOff {}", v),
-        PerformanceEvent::TimeShift(v) => format!("TimeShift {}", v),
-        PerformanceEvent::Velocity(v) => format!("Velocity {}", v),
-    };
+fn u7_to_i16(v: &u7) -> i16 {
+    let v: u8 = (*v).into();
+    v as i16
 }
 
 fn event_to_index(event: &PerformanceEvent) -> i16 {
-    return match event {
-        PerformanceEvent::NoteOn(v) => *v as i16,
-        PerformanceEvent::NoteOff(v) => *v as i16 + 128,
+    match event {
+        PerformanceEvent::NoteOn(v) => u7_to_i16(v),
+        PerformanceEvent::NoteOff(v) => u7_to_i16(v) + 128,
         PerformanceEvent::TimeShift(v) => *v as i16 + 256,
-        PerformanceEvent::Velocity(v) => *v as i16 + 356,
-    };
+        PerformanceEvent::Velocity(v) => u7_to_i16(v) / 4 + 356,
+    }
 }
 
-fn file_to_events(filename: &str) -> Vec<PerformanceEvent> {
-    let data = std::fs::read(filename).unwrap();
+fn file_to_events(filename: &PathBuf) -> Result<Vec<PerformanceEvent>, midly::Error> {
+    let data = fs::read(&filename).expect(&format!("Could not read file {:?}", filename));
 
-    let smf = Smf::parse(&data).unwrap();
+    let smf = Smf::parse(&data)?;
 
     let ticks_per_beat: u16 = match smf.header.timing {
-        Timing::Metrical(x) => x,
-        _ => panic!("oops"),
-    }
-    .into();
-    let ticks_per_beat = ticks_per_beat as f64;
-    let mut microsecs_per_beat = 0;
+        Timing::Metrical(x) => x.into(),
+        _ => panic!("Could not find metric timing header"),
+    };
+    let mut us_per_beat: Option<u32> = None;
     for event in &smf.tracks[0] {
         match event.kind {
             TrackEventKind::Meta(MetaMessage::Tempo(x)) => {
-                microsecs_per_beat = x.into();
+                us_per_beat = Some(x.into());
+                break;
             }
             _ => (),
         }
     }
-    let millis_per_tick = (microsecs_per_beat as f64) / ticks_per_beat / 1e3;
+    let us_per_beat = us_per_beat.expect("Could not find tempo message");
+    //let ms_per_tick = (us_per_beat as f64) / (ticks_per_beat as f64) / 1e3;
+    let ticks_per_sec = (ticks_per_beat as u32) * 1_000_000 / us_per_beat;
 
     let mut is_pedal_down = false;
     let mut events: Vec<PerformanceEvent> = Vec::new();
@@ -59,15 +61,32 @@ fn file_to_events(filename: &str) -> Vec<PerformanceEvent> {
     for event in &smf.tracks[1] {
         if event.delta > 0 {
             let ticks: u32 = event.delta.into();
+            // combine repeated delta time events
+            let mut t = ticks + previous_t.unwrap_or(0);
+
+            // split up times that are larger than the max time into separate events
+            let mut t_chunk = 0;
+            while t > 0 {
+                t_chunk = if t > ticks_per_sec { ticks_per_sec } else { t };
+                // time values are discretized 10 ms chunks, starting at 0
+                let time_value = (t_chunk * 100 - 50) / ticks_per_sec;
+                let event = PerformanceEvent::TimeShift(time_value as u8);
+                if previous_t == None {
+                    events.push(event);
+                } else {
+                    // update the last time event to combine timeshifts
+                    *(events.last_mut().unwrap()) = event;
+                    previous_t = None;
+                }
+                t -= t_chunk;
+            }
+            previous_t = Some(t_chunk);
+            /*
             let ticks = ticks as f64;
             // event times are stored as ticks, so convert to milliseconds
-            let ms = ticks * millis_per_tick;
+            let ms = ticks * ms_per_tick;
             // combine repeated delta time events
-            let mut t = ms
-                + match previous_t {
-                    Some(t) => t,
-                    None => 0.0,
-                };
+            let mut t = ms + previous_t.unwrap_or(0.0);
 
             // we can only represent a max time of 1 second (1000 ms)
             // so we must split up times that are larger than that
@@ -86,7 +105,9 @@ fn file_to_events(filename: &str) -> Vec<PerformanceEvent> {
                 t -= t_chunk;
             }
             previous_t = Some(t_chunk);
+            */
         }
+
         match event.kind {
             TrackEventKind::Midi {
                 channel: _,
@@ -97,27 +118,26 @@ fn file_to_events(filename: &str) -> Vec<PerformanceEvent> {
                         if is_pedal_down {
                             sustained_notes.insert(key);
                         } else {
-                            events.push(PerformanceEvent::NoteOff(key.into()));
+                            events.push(PerformanceEvent::NoteOff(key));
                             previous_t = None;
                             notes_on.remove(&key);
                         }
                     } else {
                         if sustained_notes.contains(&key) {
-                            events.push(PerformanceEvent::NoteOff(key.into()));
+                            events.push(PerformanceEvent::NoteOff(key));
                             sustained_notes.remove(&key);
                             notes_on.remove(&key);
                         }
-                        let vel: u8 = vel.into();
-                        events.push(PerformanceEvent::Velocity(vel / 4));
-                        events.push(PerformanceEvent::NoteOn(key.into()));
+                        events.push(PerformanceEvent::Velocity(vel));
+                        events.push(PerformanceEvent::NoteOn(key));
                         previous_t = None;
                         notes_on.insert(key);
                     }
                 }
                 MidiMessage::Controller { controller, value } if controller == 64 => {
                     if is_pedal_down && value < 64 {
-                        for key in &sustained_notes {
-                            events.push(PerformanceEvent::NoteOff((*key).into()));
+                        for &key in &sustained_notes {
+                            events.push(PerformanceEvent::NoteOff(key));
                             notes_on.remove(&key);
                         }
                         if sustained_notes.len() > 0 {
@@ -133,37 +153,56 @@ fn file_to_events(filename: &str) -> Vec<PerformanceEvent> {
         }
     }
 
-    return events;
+    Ok(events)
 }
 
-fn convert_maestro(input_path: &str, output_path: &str) -> std::result::Result<(), std::io::Error> {
-    if !std::path::Path::new(output_path).is_dir() {
-        fs::create_dir(output_path)?;
+fn convert_maestro(input_path: &str, output_path: &str) -> Result<(), Error> {
+    if !Path::new(output_path).is_dir() {
+        fs::create_dir(&output_path).expect(&format!(
+            "could not create output directory '{}'",
+            output_path
+        ));
     }
-    for entry in fs::read_dir(input_path)? {
-        let entry = entry?;
-        let path = entry.path();
-        println!("processing {:?}", path.file_name().unwrap());
-        let metadata = fs::metadata(&path)?;
-        if metadata.is_file() {
+    for entry in fs::read_dir(&input_path)
+        .expect(&format!("could not read input directory '{}'", input_path))
+    {
+        let path = entry?.path();
+        if path.metadata()?.is_file() {
             continue;
         }
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            let filename = path.file_name().unwrap();
-            let path = entry.path();
-            let filepath = path.into_os_string().into_string().unwrap();
-            let events = file_to_events(&filepath);
+        println!("processing {:?}...", path.file_name().unwrap());
+        for entry in path.read_dir()? {
+            let path = entry?.path();
+            let events = match file_to_events(&path) {
+                Ok(events) => events,
+                Err(error) => {
+                    println!(
+                        "Failed to parse file {:?} due to midly error: {}",
+                        path, error
+                    );
+                    continue;
+                }
+            };
             let events: Vec<i16> = events.into_iter().map(|x| event_to_index(&x)).collect();
+            let output_name = format!(
+                "{}/{}.pt",
+                output_path,
+                path.file_name().unwrap().to_str().unwrap()
+            );
+            println!("{}", output_name);
             Tensor::of_slice(&events)
-                .save(format!("{}/{:?}.pt", output_path, filename))
-                .unwrap();
+                .save(output_name)
+                .expect("unable to save events to pytorch file");
         }
     }
+    println!("done!");
     return Ok(());
 }
 
-fn main() {
-    convert_maestro("maestro-v3.0.0", "tensors").unwrap();
+fn main() -> Result<(), Error> {
+    let args: Vec<String> = env::args().collect();
+    let input_path = &args[1];
+    let output_path = &args[2];
+    convert_maestro(input_path, output_path)?;
+    return Ok(());
 }
