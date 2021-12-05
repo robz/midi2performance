@@ -1,8 +1,12 @@
-# Preprocess MIDI files into performance events
+# Pre-process MIDI files into performance events
 
-This Rust executable converts MIDI files into pytorch tensors using the performance representation described in the PerformanceRNN paper [1]. It was written specifically to preprocess the files in the [MAESTRO dataset](https://magenta.tensorflow.org/datasets/maestro) [2].
+This Rust executable converts MIDI files into PyTorch tensors using the performance representation described in the PerformanceRNN paper [1]. It was written specifically to pre-process the files in the [MAESTRO dataset](https://magenta.tensorflow.org/datasets/maestro) [2] and I haven't yet tested it only other MIDI files.
 
-Usage:
+I originally wrote this [in Python to reproduce PerformanceRNN](https://colab.research.google.com/drive/1mTmJWWdz7_gbYWXOlwNn4vGN_DVjnlee?usp=sharing) but this Rust version is about ~50x faster, which will make it easier to pre-process larger MIDI datasets.
+
+It uses [`midly`](https://docs.rs/midly/latest/midly/) to read MIDI files and [`tch`](https://docs.rs/tch/latest/tch/) to write to PyTorch tensor files.
+
+## Usage
 
 ```
 cargo run [input_directory] [output_directory] 
@@ -10,12 +14,14 @@ cargo run [input_directory] [output_directory]
 
 Example: `cargo run ~/Downloads/maestro-v3.0.0 output/maestro-v3.0.0`
 
-This will recursively traverse the input directory, convert all MIDI files into tensors, and then write them out to the output directory in the same file system structure. They can be then read in pytorch like this:
+This will recursively traverse the input directory, convert all MIDI files into tensors, and then write them out to the output directory in the same file system structure. They can then be read in PyTorch like this:
 
 ```
 import torch
-v = torch.jit.load('file.midi.pt').state_dict()['0']
+events = torch.jit.load('file.midi.pt').state_dict()['0']
 ```
+
+## Representation
 
 Each output file is an i16 1D tensor, where each value has the following meaning:
 

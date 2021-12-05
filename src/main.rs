@@ -1,10 +1,5 @@
 use midly::{num::u7, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
-use std::{
-    collections::HashSet,
-    env, fs,
-    io::Error,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashSet, env, fs, io::Error, path::Path};
 use tch::Tensor;
 
 #[derive(Debug)]
@@ -29,11 +24,7 @@ fn event_to_index(event: &PerformanceEvent) -> i16 {
     }
 }
 
-fn file_to_events(filename: &PathBuf) -> Result<Vec<PerformanceEvent>, midly::Error> {
-    let data = fs::read(&filename).expect(&format!("Could not read file {:?}", filename));
-
-    let smf = Smf::parse(&data)?;
-
+fn midi_to_events(smf: &Smf) -> Vec<PerformanceEvent> {
     let ticks_per_beat: u16 = match smf.header.timing {
         Timing::Metrical(x) => x.into(),
         _ => panic!("Could not find metric timing header"),
@@ -49,7 +40,6 @@ fn file_to_events(filename: &PathBuf) -> Result<Vec<PerformanceEvent>, midly::Er
         }
     }
     let us_per_beat = us_per_beat.expect("Could not find tempo message");
-    //let ms_per_tick = (us_per_beat as f64) / (ticks_per_beat as f64) / 1e3;
     let ticks_per_sec = (ticks_per_beat as u32) * 1_000_000 / us_per_beat;
 
     let mut is_pedal_down = false;
@@ -128,7 +118,7 @@ fn file_to_events(filename: &PathBuf) -> Result<Vec<PerformanceEvent>, midly::Er
         }
     }
 
-    Ok(events)
+    events
 }
 
 fn convert_directory_recursively(input_path: &str, output_path: &str) -> Result<(), Error> {
@@ -149,8 +139,9 @@ fn convert_directory_recursively(input_path: &str, output_path: &str) -> Result<
             convert_directory_recursively(path.to_str().unwrap(), &output_subdir)?;
             continue;
         }
-        let events = match file_to_events(&path) {
-            Ok(events) => events,
+        let data = fs::read(&path).expect(&format!("Could not read file {:?}", path));
+        let smf = match Smf::parse(&data) {
+            Ok(smf) => smf,
             Err(error) => {
                 println!(
                     "Failed to parse file {:?} due to midly error: {}",
@@ -159,7 +150,10 @@ fn convert_directory_recursively(input_path: &str, output_path: &str) -> Result<
                 continue;
             }
         };
-        let events: Vec<i16> = events.into_iter().map(|x| event_to_index(&x)).collect();
+        let events: Vec<i16> = midi_to_events(&smf)
+            .into_iter()
+            .map(|x| event_to_index(&x))
+            .collect();
         let output_name = format!("{}/{}.pt", output_path, name);
         println!("{}", output_name);
         Tensor::of_slice(&events)
