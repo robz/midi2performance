@@ -1,4 +1,4 @@
-use midly::{num::u7, MetaMessage, MidiMessage, Smf, Timing, TrackEventKind};
+use midly::{num::u7, Format, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
 use std::collections::HashSet;
 
 #[derive(Debug)]
@@ -12,6 +12,17 @@ pub enum PerformanceEvent {
 fn u7_to_i16(v: &u7) -> i16 {
     let v: u8 = (*v).into();
     v as i16
+}
+
+#[allow(dead_code)]
+fn timeshift_to_ms(timeshift: i16) -> i16 {
+    // timeshifts are discretized 10 ms chunks, starting at 0
+    (timeshift + 1) * 10
+}
+
+fn ticks_to_timeshift(ticks: u32, ticks_per_sec: u32) -> u32 {
+    // timeshifts are discretized 10 ms chunks, starting at 0
+    (ticks * 100 - 50) / ticks_per_sec
 }
 
 pub fn event_to_index(event: PerformanceEvent) -> i16 {
@@ -38,13 +49,136 @@ pub fn index_to_event(idx: i16) -> Result<PerformanceEvent, String> {
     }
 }
 
-pub fn midi_to_events(smf: &Smf) -> Vec<PerformanceEvent> {
+fn merge_parallel_tracks<'a>(tracks: &Vec<Vec<TrackEvent<'a>>>) -> Vec<TrackEvent<'a>> {
+    let mut combined_track = vec![];
+    for track in tracks {
+        let mut t = 0u32;
+        for event in track {
+            let delta: u32 = event.delta.into();
+            t += delta;
+            combined_track.push((event, t));
+        }
+    }
+    combined_track.sort_by_key(|v| v.1);
+    let mut prev_t = 0u32;
+    let mut track: Vec<TrackEvent> = vec![];
+    for (event, new_t) in combined_track {
+        track.push(TrackEvent {
+            delta: (new_t - prev_t).into(),
+            kind: event.kind,
+        });
+        prev_t = new_t;
+    }
+    return track;
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::Rng;
+    use super::*;
+
+    fn create_random_midievent() -> TrackEvent<'static> {
+        let channel = rand::thread_rng().gen_range(0..16);
+        let delta = rand::thread_rng().gen_range(0..100);
+        let key = rand::thread_rng().gen_range(0..128);
+        let vel = rand::thread_rng().gen_range(0..128);
+        let note_on = rand::thread_rng().gen_bool(0.5);
+        return TrackEvent {
+            delta: delta.into(),
+            kind: TrackEventKind::Midi {
+                channel: channel.into(),
+                message: if note_on {
+                    MidiMessage::NoteOn {
+                        key: key.into(),
+                        vel: vel.into(),
+                    }
+                } else {
+                    MidiMessage::NoteOff {
+                        key: key.into(),
+                        vel: vel.into(),
+                    }
+                },
+            },
+        };
+    }
+
+    #[test]
+    fn single_track_remains_the_same() {
+        let mut tracks = vec![vec![]];
+        assert_eq!(merge_parallel_tracks(&tracks), tracks[0]);
+
+        tracks[0].push(TrackEvent {
+            delta: 0.into(),
+            kind: TrackEventKind::Meta(MetaMessage::TrackName(b"violin")),
+        });
+        assert_eq!(merge_parallel_tracks(&tracks), tracks[0]);
+
+        for _ in 0..100 {
+            tracks[0].push(create_random_midievent());
+        }
+        assert_eq!(merge_parallel_tracks(&tracks), tracks[0]);
+    }
+
+    #[test]
+    fn two_tracks_are_concated() {
+        let tracks = vec![
+            vec![TrackEvent {
+                delta: 0.into(),
+                kind: TrackEventKind::Meta(MetaMessage::TrackName(b"violin")),
+            }],
+            (0..100).map(|_| create_random_midievent()).collect(),
+        ];
+        assert_eq!(
+            merge_parallel_tracks(&tracks),
+            tracks[0]
+                .iter()
+                .cloned()
+                .chain(tracks[1].iter().cloned())
+                .collect::<Vec<TrackEvent>>()
+        );
+    }
+
+    #[test]
+    fn multi_tracks_are_combined() {
+        let track0: Vec<TrackEvent> = (0..2).map(|_| create_random_midievent()).collect();
+        let track1: Vec<TrackEvent> = (0..2).map(|_| create_random_midievent()).collect();
+        let track0_delta = track0.iter().fold(0u32, |acc, event: &TrackEvent| {
+            let delta: u32 = event.delta.into();
+            acc + delta
+        });
+
+        let mut track1_copy = track1.clone();
+        let delta: u32 = track1_copy[0].delta.into();
+        track1_copy[0].delta = (delta + track0_delta).into();
+
+        let tracks = vec![track0, track1_copy];
+        assert_eq!(
+            merge_parallel_tracks(&tracks),
+            tracks[0]
+                .iter()
+                .cloned()
+                .chain(track1.iter().cloned())
+                .collect::<Vec<TrackEvent>>()
+        );
+    }
+}
+
+fn get_tracks<'a>(smf: &mut Smf<'a>) -> Vec<TrackEvent<'a>> {
+    return match smf.header.format {
+        Format::SingleTrack => smf.tracks.remove(0),
+        Format::Parallel => merge_parallel_tracks(&smf.tracks),
+        Format::Sequential => panic!("Sequential tracks not supported"),
+    };
+}
+
+pub fn midi_to_events(smf: &mut Smf) -> Vec<PerformanceEvent> {
     let ticks_per_beat: u16 = match smf.header.timing {
         Timing::Metrical(x) => x.into(),
         _ => panic!("Could not find metric timing header"),
     };
+    let tracks = get_tracks(smf);
     let mut us_per_beat: Option<u32> = None;
-    for event in &smf.tracks[0] {
+    for event in &tracks {
         match event.kind {
             TrackEventKind::Meta(MetaMessage::Tempo(x)) => {
                 us_per_beat = Some(x.into());
@@ -55,6 +189,10 @@ pub fn midi_to_events(smf: &Smf) -> Vec<PerformanceEvent> {
     }
     let us_per_beat = us_per_beat.expect("Could not find tempo message");
     let ticks_per_sec = (ticks_per_beat as u32) * 1_000_000 / us_per_beat;
+    //println!(
+    //    "ticks per sec: {} ;; ticks_per_beat : {} ;; us_per_beat: {}",
+    //    ticks_per_sec, ticks_per_beat, us_per_beat
+    //);
 
     let mut is_pedal_down = false;
     let mut events: Vec<PerformanceEvent> = Vec::new();
@@ -62,7 +200,7 @@ pub fn midi_to_events(smf: &Smf) -> Vec<PerformanceEvent> {
     let mut notes_on: HashSet<i16> = HashSet::new();
     let mut previous_t = None;
 
-    for event in &smf.tracks[1] {
+    for event in tracks {
         if event.delta > 0 {
             let ticks: u32 = event.delta.into();
             // combine repeated delta time events
@@ -72,9 +210,8 @@ pub fn midi_to_events(smf: &Smf) -> Vec<PerformanceEvent> {
             let mut t_chunk = 0;
             while t > 0 {
                 t_chunk = if t > ticks_per_sec { ticks_per_sec } else { t };
-                // time values are discretized 10 ms chunks, starting at 0
-                let time_value = (t_chunk * 100 - 50) / ticks_per_sec;
-                let event = PerformanceEvent::TimeShift(time_value as i16);
+                let timeshift = ticks_to_timeshift(t_chunk, ticks_per_sec);
+                let event = PerformanceEvent::TimeShift(timeshift as i16);
                 if previous_t == None {
                     events.push(event);
                 } else {

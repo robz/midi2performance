@@ -23,7 +23,7 @@ fn convert_directory_recursively(input_path: &str, output_path: &str) -> Result<
             continue;
         }
         let data = fs::read(&path).expect(&format!("Could not read file {:?}", path));
-        let smf = match Smf::parse(&data) {
+        let mut smf = match Smf::parse(&data) {
             Ok(smf) => smf,
             Err(error) => {
                 println!(
@@ -33,7 +33,7 @@ fn convert_directory_recursively(input_path: &str, output_path: &str) -> Result<
                 continue;
             }
         };
-        let events: Vec<i16> = lib::midi_to_events(&smf)
+        let events: Vec<i16> = lib::midi_to_events(&mut smf)
             .into_iter()
             .map(|x| lib::event_to_index(x))
             .collect();
