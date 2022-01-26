@@ -189,41 +189,40 @@ pub fn midi_to_events(smf: &mut Smf) -> Vec<PerformanceEvent> {
     }
     let us_per_beat = us_per_beat.expect("Could not find tempo message");
     let ticks_per_sec = (ticks_per_beat as u32) * 1_000_000 / us_per_beat;
-    //println!(
-    //    "ticks per sec: {} ;; ticks_per_beat : {} ;; us_per_beat: {}",
-    //    ticks_per_sec, ticks_per_beat, us_per_beat
-    //);
 
     let mut is_pedal_down = false;
     let mut events: Vec<PerformanceEvent> = Vec::new();
     let mut sustained_notes: HashSet<i16> = HashSet::new();
     let mut notes_on: HashSet<i16> = HashSet::new();
-    let mut previous_t = None;
+    let mut previous_ticks = 0;
 
     for event in tracks {
         if event.delta > 0 {
-            let ticks: u32 = event.delta.into();
+            let mut ticks: u32 = event.delta.into();
             // combine repeated delta time events
-            let mut t = ticks + previous_t.unwrap_or(0);
+            ticks += previous_ticks;
 
             // split up times that are larger than the max time into separate events
-            let mut t_chunk = 0;
-            while t > 0 {
-                t_chunk = if t > ticks_per_sec { ticks_per_sec } else { t };
-                let timeshift = ticks_to_timeshift(t_chunk, ticks_per_sec);
-                let event = PerformanceEvent::TimeShift(timeshift as i16);
-                if previous_t == None {
-                    events.push(event);
+            let mut ticks_chunk = 0;
+            while ticks > 0 {
+                ticks_chunk = if ticks > ticks_per_sec { ticks_per_sec } else { ticks };
+                let timeshift = ticks_to_timeshift(ticks_chunk, ticks_per_sec);
+                let time_event = PerformanceEvent::TimeShift(timeshift as i16);
+                if previous_ticks == 0 {
+                    events.push(time_event);
                 } else {
                     // update the last time event to combine timeshifts
-                    *(events.last_mut().unwrap()) = event;
-                    previous_t = None;
+                    let last_event_idx = events.len() - 1;
+                    events[last_event_idx] = time_event;
+                    previous_ticks = 0;
                 }
-                t -= t_chunk;
+                ticks -= ticks_chunk;
             }
-            previous_t = Some(t_chunk);
+            // record ticks from the last chunk
+            previous_ticks = ticks_chunk;
         }
 
+        let events_len_start = events.len();
         match event.kind {
             TrackEventKind::Midi {
                 channel: _,
@@ -232,33 +231,28 @@ pub fn midi_to_events(smf: &mut Smf) -> Vec<PerformanceEvent> {
                 MidiMessage::NoteOn { key, vel } => {
                     let key = u7_to_i16(&key);
                     if vel == 0 {
-                        if is_pedal_down {
+                        if is_pedal_down && notes_on.contains(&key) {
                             sustained_notes.insert(key);
-                        } else {
+                        } else if notes_on.remove(&key) {
                             events.push(PerformanceEvent::NoteOff(key));
-                            previous_t = None;
-                            notes_on.remove(&key);
                         }
                     } else {
-                        if sustained_notes.contains(&key) {
+                        if sustained_notes.remove(&key) {
                             events.push(PerformanceEvent::NoteOff(key));
-                            sustained_notes.remove(&key);
-                            notes_on.remove(&key);
+                            events.push(PerformanceEvent::Velocity(u7_to_i16(&vel)));
+                            events.push(PerformanceEvent::NoteOn(key));
+                        } else if notes_on.insert(key) {
+                            events.push(PerformanceEvent::Velocity(u7_to_i16(&vel)));
+                            events.push(PerformanceEvent::NoteOn(key));
                         }
-                        events.push(PerformanceEvent::Velocity(u7_to_i16(&vel)));
-                        events.push(PerformanceEvent::NoteOn(key));
-                        previous_t = None;
-                        notes_on.insert(key);
                     }
                 }
                 MidiMessage::Controller { controller, value } if controller == 64 => {
                     if is_pedal_down && value < 64 {
                         for &key in &sustained_notes {
-                            events.push(PerformanceEvent::NoteOff(key));
-                            notes_on.remove(&key);
-                        }
-                        if sustained_notes.len() > 0 {
-                            previous_t = None;
+                            if notes_on.remove(&key) {
+                                events.push(PerformanceEvent::NoteOff(key));
+                            }
                         }
                         sustained_notes.clear();
                     }
@@ -267,6 +261,9 @@ pub fn midi_to_events(smf: &mut Smf) -> Vec<PerformanceEvent> {
                 _ => {}
             },
             _ => {}
+        }
+        if events.len() > events_len_start {
+            previous_ticks = 0;
         }
     }
 
